@@ -1,7 +1,7 @@
 {
   "name": "photo-map-server",
   "version": "1.0.0",
-  "description": "Upload markers without auth; admin approves/rejects with Firebase token; awards points.",
+  "description": "",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
