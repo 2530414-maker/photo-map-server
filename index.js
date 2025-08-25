@@ -1,4 +1,4 @@
-// index.js — 업로드는 인증 없이, 운영자 승인/취소만 토큰검증
+// index.js — 업로드는 인증 없이, 운영자 승인/취소만 토큰검증 + 포인트 적립
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
@@ -12,8 +12,9 @@ app.use(cors());
 app.use(express.json({ limit: "30mb" })); // 큰 이미지도 OK
 
 const dbFilePath = path.join(__dirname, "database.json");
+const pointsFilePath = path.join(__dirname, "points.json");
 
-// DB helper
+// ---- DB helpers ----
 const readDatabase = (cb) => {
   fs.readFile(dbFilePath, "utf8", (err, data) => {
     if (err) { if (err.code === "ENOENT") return cb(null, []); return cb(err); }
@@ -21,6 +22,25 @@ const readDatabase = (cb) => {
   });
 };
 const writeDatabase = (data, cb) => fs.writeFile(dbFilePath, JSON.stringify(data, null, 2), "utf8", cb);
+
+// ---- Points helpers ----
+const readPoints = (cb) => {
+  fs.readFile(pointsFilePath, "utf8", (err, data) => {
+    if (err) { if (err.code === "ENOENT") return cb(null, {}); return cb(err); }
+    try { cb(null, JSON.parse(data || "{}")); } catch (e) { cb(e); }
+  });
+};
+const writePoints = (obj, cb) => fs.writeFile(pointsFilePath, JSON.stringify(obj, null, 2), "utf8", cb);
+function addPoints(uid, name, delta, cb) {
+  if (!uid) return cb(null, null); // uid 없으면 스킵
+  readPoints((err, p) => {
+    if (err) return cb(err);
+    if (!p[uid]) p[uid] = { name: name || "익명", points: 0 };
+    p[uid].points += delta;
+    if (name && name !== "익명") p[uid].name = name;
+    writePoints(p, (werr) => { if (werr) return cb(werr); cb(null, p[uid].points); });
+  });
+}
 
 // ---- Admin 초기화 ----
 const ADMIN_UIDS = new Set((process.env.ADMIN_UIDS || "").split(",").map(s=>s.trim()).filter(Boolean));
@@ -110,25 +130,48 @@ app.post("/markers/:id/cleanup-request", (req, res) => {
   });
 });
 
-// 승인(운영자)
+// 승인(운영자) — 포인트 적립 후 마커 삭제
 app.post("/markers/:id/approve", admin ? [verifyFirebaseToken, requireAdmin] : [], (req, res) => {
   if (!admin) return res.status(500).json({ error: "ADMIN_SDK_NOT_INSTALLED" });
   const { id } = req.params;
+
+  // 포인트 상수 (환경변수로 조정 가능)
+  const UPLOADER_AWARD = Number(process.env.UPLOADER_AWARD || 10);
+  const CLAIMER_AWARD  = Number(process.env.CLAIMER_AWARD  || 10);
+
   readDatabase((err, markers) => {
     if (err) return res.status(500).json({ error: "Failed to read database" });
     const idx = markers.findIndex(m => m.id === id);
     if (idx === -1) return res.status(404).json({ error: "Marker not found" });
-    const { uploaderUid, claimedByUid } = markers[idx];
-    console.log("[approve] award +10 uploader:", uploaderUid, "claimer:", claimedByUid);
-    markers.splice(idx, 1);
-    writeDatabase(markers, (werr) => {
-      if (werr) return res.status(500).json({ error: "Failed to approve" });
-      res.json({ ok: true, awarded: { uploaderUid, claimedByUid } });
+
+    const marker = markers[idx];
+    const { uploaderUid, uploader, claimedByUid, claimedByName } = marker;
+    console.log("[approve] award +%d uploader:%s claimer:%s", UPLOADER_AWARD, uploaderUid, claimedByUid);
+
+    // 포인트 적립 순차 수행
+    addPoints(uploaderUid, uploader, UPLOADER_AWARD, (e1, uploaderTotal) => {
+      if (e1) return res.status(500).json({ error: "Failed to add points (uploader)" });
+      addPoints(claimedByUid, claimedByName, CLAIMER_AWARD, (e2, claimerTotal) => {
+        if (e2) return res.status(500).json({ error: "Failed to add points (claimer)" });
+
+        // 마커 제거
+        markers.splice(idx, 1);
+        writeDatabase(markers, (werr) => {
+          if (werr) return res.status(500).json({ error: "Failed to approve" });
+          res.json({
+            ok: true,
+            awarded: {
+              uploader: { uid: uploaderUid || null, name: uploader || "익명", delta: UPLOADER_AWARD, total: uploaderTotal ?? null },
+              claimer:  { uid: claimedByUid || null, name: claimedByName || "익명", delta: CLAIMER_AWARD, total: claimerTotal ?? null }
+            }
+          });
+        });
+      });
     });
   });
 });
 
-// 취소(운영자)
+// 취소(운영자) — 대기로 되돌림
 app.post("/markers/:id/reject", admin ? [verifyFirebaseToken, requireAdmin] : [], (req, res) => {
   if (!admin) return res.status(500).json({ error: "ADMIN_SDK_NOT_INSTALLED" });
   const { id } = req.params;
@@ -150,6 +193,18 @@ app.post("/markers/:id/reject", admin ? [verifyFirebaseToken, requireAdmin] : []
 app.get("/debug/whoami",
   admin ? verifyFirebaseToken : (req, res) => res.status(500).json({ error: "ADMIN_SDK_NOT_INSTALLED" }),
   (req, res) => res.json({ uid: req.user?.uid || null, isAdmin: ADMIN_UIDS.has(req.user?.uid), ADMIN_UIDS: [...ADMIN_UIDS] })
+);
+
+// 내 포인트 조회
+app.get("/me/points",
+  admin ? verifyFirebaseToken : (req, res) => res.status(500).json({ error: "ADMIN_SDK_NOT_INSTALLED" }),
+  (req, res) => {
+    readPoints((err, p) => {
+      if (err) return res.status(500).json({ error: "Failed to read points" });
+      const me = p[req.user.uid] || { name: req.user.name, points: 0 };
+      res.json(me);
+    });
+  }
 );
 
 const PORT = process.env.PORT || 3000;
